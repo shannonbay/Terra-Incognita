@@ -1,4 +1,4 @@
-# World Model Engine — Design Specification v3
+# World Model Engine — Design Specification v4
 
 ## 1. Introduction
 
@@ -17,6 +17,7 @@ The system is designed to scale to thousands of entities over thousands of itera
 - **Agent-agnostic**: External agents connect via a standard HTTP API — any LLM, any harness, any language
 - **Expressiveness**: Full Go for world logic — conditionals, closures, composition, anything the language supports
 - **Simplicity**: The library API is small enough for an LLM to learn from a few examples
+- **Observability**: Every state mutation is logged as a delta — full simulation history is reconstructable from a single file
 - **AGI test**: The generative space of possible worlds creates an open-ended, adversarial benchmark that resists overfitting
 
 ---
@@ -68,6 +69,10 @@ func main() {
         TickUnit: "day",
         MaxTicks: 365,
         MaxActionsPerTick: 3,
+        Log: we.LogConfig{
+            Dir:              "./runs",        // directory for run log files
+            SnapshotInterval: 100,             // full state snapshot every N ticks
+        },
     })
 
     // ... define types, spawn entities, run ...
@@ -92,6 +97,9 @@ ground.Resources(we.P{
     "fish_stock": 0.0,
 })
 
+// Mark fish_stock as hidden — agents can't see it on other entities
+ground.Hidden("fish_stock")
+
 ground.Tick(func(e *we.Entity, dt float64) {
     stock := e.Get("fish_stock")
     max := e.Param("max_fish_stock")
@@ -99,9 +107,21 @@ ground.Tick(func(e *we.Entity, dt float64) {
     e.Set("fish_stock", math.Min(max, stock+rate*dt))
 })
 
-ground.Action("fish", func(e *we.Entity, p we.P) {
+ground.Action("fish", func(target *we.Entity, invoker *we.Entity, p we.P) {
     skill := p.Float("skill")
-    e.Set("fish_stock", math.Max(0, e.Get("fish_stock")-skill*0.5))
+    caught := skill * 0.3
+
+    // Check invoker can pay the cost — GetOr returns 0 for missing resources
+    if invoker.GetOr("fuel", 0) < 1.0 {
+        return // not enough fuel to fish
+    }
+
+    // Update the fishing ground
+    target.Set("fish_stock", math.Max(0, target.Get("fish_stock")-skill*0.5))
+
+    // Update the invoker
+    invoker.Set("catch", invoker.Get("catch")+caught)
+    invoker.Set("fuel", invoker.Get("fuel")-1.0)
 })
 ```
 
@@ -234,8 +254,10 @@ The `*Entity` passed to tick and action functions:
 
 ```go
 // State access
-e.Get("fuel") float64             // get a resource value
+e.Get("fuel") float64             // get a resource value (panics if missing)
+e.GetOr("fuel", 0.0) float64     // get a resource value with default (returns default if missing)
 e.Set("fuel", 80.0)               // set a resource value
+e.Has("fuel") bool                // check if a resource exists
 e.Param("speed") float64          // get an immutable parameter
 e.ID() string                     // entity ID
 e.Type() string                   // type name
@@ -292,7 +314,28 @@ set.Avg("resource_name") float64
 
 Types are inferred from the default values provided in the type definition. `e.Get()` and `e.Set()` handle the common `float64` case; complex types use dedicated methods (`ListPush`, `QueuePop`, `MapSet`, etc.).
 
-### 4.2 Property Table Storage
+### 4.2 Resource Visibility
+
+Resources can be marked with a visibility level that controls what external agents can see when querying other entities:
+
+```go
+ground.Hidden("fish_stock")    // invisible to other entities' perception
+ground.Private("internal_id")  // visible only to the owning entity's tick function
+```
+
+By default, resources are **public** — visible to any entity or agent that can query the owning entity. Visibility levels:
+
+| Level | Tick function (self) | Tick function (other entity) | Agent perception |
+|-------|---------------------|------------------------------|-----------------|
+| **Public** (default) | Yes | Yes | Yes |
+| **Hidden** | Yes | Yes | No |
+| **Private** | Yes | No | No |
+
+Hidden resources are the primary tool for information asymmetry in the game mode. A fishing ground's `fish_stock` being hidden means agents must infer stock levels from action feedback (catch rates declining) rather than reading the value directly. This makes exploration and hypothesis formation genuine challenges.
+
+Note: visibility is enforced by the perception system and query engine. Compiled tick functions running inside the engine can always read any entity's state — visibility is about what information leaves the engine via the agent provider interface.
+
+### 4.3 Property Table Storage
 
 Internally, each resource field maps to a typed property table — a contiguous array indexed by entity ID. This is invisible to the world author but enables cache-friendly iteration, cheap snapshots, and efficient rollback for sensitivity analysis.
 
@@ -315,7 +358,28 @@ Weights can represent distance, cost, time, or any domain-appropriate metric.
 
 Connections are stored as adjacency lists indexed by entity ID, with secondary indexes on connection type for efficient filtered traversal.
 
-### 5.3 Mutable Connections
+### 5.3 Connection Descriptions
+
+By default, agents see only that a connection exists and where it leads — not its type, weight, or any metadata. The world author can register a function that controls what description agents receive for each connection:
+
+```go
+w.ConnectionDescription(func(conn we.Connection) string {
+    switch conn.Type {
+    case "sea_route":
+        return "A well-traveled sea route"
+    case "shore_access":
+        return "A short path to the shore"
+    default:
+        return "" // no description — agent sees only the destination
+    }
+})
+```
+
+The function returns an unstructured string — it could be natural language, JSON, or anything else. It's up to the agent to interpret it. The function receives the full `Connection` struct (type, weight, endpoints) but can choose to reveal as little or as much as the world author wants. This keeps information asymmetry in the world author's hands and forces agents to learn through experience.
+
+Compiled NPC tick functions running inside the engine can always access the full connection data directly.
+
+### 5.4 Mutable Connections
 
 The connection graph is mutable during simulation:
 
@@ -329,36 +393,161 @@ e.Disconnect("former_ally", "alliance")
 
 ## 6. Actions
 
-### 6.1 Definition
+### 6.1 Two-Party Action Pattern
 
-Actions are registered on a type:
+Every action is a two-party transaction. The action handler receives the **target entity** (the one the action is defined on), the **invoking entity** (whoever called `e.Act()`), and the action parameters:
 
 ```go
-port := w.Type("Port")
-
-port.Action("refuel", func(e *we.Entity, p we.P) {
+port.Action("refuel", func(target *we.Entity, invoker *we.Entity, p we.P) {
     amount := p.Float("amount")
-    price := e.Param("fuel_price")
-    e.Set("fuel_supply", e.Get("fuel_supply")-amount)
-    // The invoking entity pays — cross-entity interaction
-    // handled via the action dispatcher (see §6.3)
+    price := target.Param("fuel_price")
+    cost := amount * price
+
+    // Check the invoker can afford it
+    if invoker.GetOr("money", 0) < cost {
+        return // can't afford — action fails silently
+    }
+
+    // Update both parties
+    target.Set("fuel_supply", target.Get("fuel_supply")-amount)
+    invoker.Set("fuel", invoker.Get("fuel")+amount)
+    invoker.Set("money", invoker.Get("money")-cost)
 })
 ```
 
-### 6.2 Invocation
+For self-targeted actions (when no `"target"` is specified), `target` and `invoker` are the same entity.
+
+### 6.2 Resource Availability as a Natural Guard
+
+Actions should use `GetOr` to check whether the invoker has the required resources. An entity that lacks a resource gets the default value (typically 0), which means it naturally fails the availability check. This handles three cases uniformly:
+
+- The invoker has the resource but not enough → action fails
+- The invoker has the resource at zero → action fails
+- The invoker doesn't have that resource type at all → `GetOr` returns 0 → action fails
+
+This means world authors don't need to worry about what type of entity invokes an action. A drone with no `money` resource can try to refuel; it just silently fails because `GetOr("money", 0)` returns 0, which is less than any positive cost. No runtime errors, no special casing.
+
+### 6.3 Action Locality
+
+Actions are **local** by default — the invoker must be colocated with the target. Specifically, the invoker must either be *inside* the target (e.g., a boat inside a lake) or the target must be *inside* the invoker (e.g., cargo inside a ship). This makes spatial positioning meaningful: you have to *be somewhere* to interact with it.
+
+Actions can be declared **remote** to bypass this constraint:
+
+```go
+// Local action (default) — invoker must be colocated with target
+port.Action("refuel", func(target *we.Entity, invoker *we.Entity, p we.P) {
+    // ...
+})
+
+// Remote action — can be invoked from anywhere if the invoker has a reference
+beacon.RemoteAction("distress_signal", func(target *we.Entity, invoker *we.Entity, p we.P) {
+    target.Set("alert_level", target.Get("alert_level")+1)
+    // The beacon records who signaled — but the invoker doesn't need to be nearby
+})
+```
+
+Remote actions enable signaling, broadcasting, and coordination across distance. A market entity might expose a remote `place_order` action. A command center might accept remote `report` actions. The distinction keeps most world interactions spatially grounded while allowing deliberate exceptions.
+
+### 6.4 Invocation
 
 Tick functions invoke actions via `e.Act()`:
 
 ```go
-e.Act("fish", we.P{"skill": 5})                          // act on self/location
+e.Act("fish", we.P{"skill": 5})                             // act on self/location
 e.Act("refuel", we.P{"amount": 50, "target": "port_alpha"}) // act on a specific target
 ```
 
-### 6.3 Cross-Entity Actions
+When no `"target"` is specified, the engine resolves the action against the invoker's current location or the invoker itself. When a `"target"` is specified, the engine resolves the target entity by ID. For local actions, the engine verifies colocation before executing; if the invoker is not colocated, the action fails.
 
-When an action includes a `"target"` param, the engine resolves the target entity and executes the action handler against the target's state. The invoking entity's ID is available to the action handler via `p.String("_invoker")`, enabling interactions where both entities are affected (e.g., deducting money from the invoker while adding fuel).
+### 6.5 Action Feedback
 
-### 6.4 Actions Per Tick
+Actions return a result indicating success or failure:
+
+```go
+ground.Action("fish", func(target *we.Entity, invoker *we.Entity, p we.P) we.ActionResult {
+    skill := p.Float("skill")
+
+    if invoker.GetOr("fuel", 0) < 1.0 {
+        return we.Fail("insufficient resources")
+    }
+
+    stock := target.Get("fish_stock")
+    if stock <= 0 {
+        return we.Fail("nothing to catch")
+    }
+
+    caught := math.Min(skill*0.3, stock)
+    target.Set("fish_stock", stock-caught)
+    invoker.Set("catch", invoker.Get("catch")+caught)
+    invoker.Set("fuel", invoker.Get("fuel")-1.0)
+
+    return we.OK()
+})
+```
+
+Action results are recorded in the event log and included in the `history` field of the agent provider request. The world author controls how much detail to include in failure reasons — they may give specific feedback (`"not enough money"`) or vague feedback (`"action failed"`) or no reason at all (`we.Fail("")`), forcing the agent to infer what went wrong.
+
+For external agents, the history field shows:
+
+```json
+"history": [
+    { "tick": 41, "actions": [{ "name": "fish", "params": { "skill": 5 } }], "result": "ok" },
+    { "tick": 42, "actions": [{ "name": "fish", "params": { "skill": 5 } }], "result": "failed", "reason": "nothing to catch" }
+]
+```
+
+### 6.6 Built-In Actions
+
+The engine provides `move` as a built-in action available to all entities:
+
+```go
+e.Act("move", we.P{"target": "port_alpha"})
+```
+
+The engine validates that the target is reachable (connected to the entity's current location), applies the world's movement cost function if one is registered, and moves the entity. If the cost function returns `false` (e.g., not enough fuel), the move fails and the entity stays put.
+
+If a type defines its own `move` action, it overrides the built-in for that type.
+
+### 6.7 Movement Cost
+
+The world author can register a global movement cost function:
+
+```go
+w.MovementCost(func(mover *we.Entity, conn we.Connection) bool {
+    fuelCost := conn.Weight * 0.1
+    if mover.GetOr("fuel", 0) < fuelCost {
+        return false // not enough fuel — move fails
+    }
+    mover.Set("fuel", mover.Get("fuel")-fuelCost)
+    return true // move succeeds
+})
+```
+
+This keeps movement economics in one place rather than scattered across every entity type. A world with no movement cost function gets free movement. The `Connection` struct provides `Type`, `Weight`, `From`, and `To` for the cost function to use.
+
+### 6.8 Entity Lifecycle
+
+Entities can be created and destroyed during simulation:
+
+```go
+// Inside a tick function — spawn a new entity
+e.Spawn("order_123", "Order", we.Init{
+    Resources: we.P{"quantity": 50, "price": 12.5},
+    Location:  "market_alpha",
+})
+
+// Destroy an entity
+e.Destroy("order_123")
+
+// Destroy self
+e.DestroySelf()
+```
+
+Spawned entities must reference an existing type, and optionally specify a location (which entity to place them inside). Destroyed entities are removed from all property tables, the connection graph, and their container at end of tick.
+
+This enables worlds where entities are created dynamically: markets that spawn order entities, factories that produce goods, agents that die when health reaches zero, ecosystems where organisms reproduce.
+
+### 6.9 Actions Per Tick
 
 A tick function may invoke zero or more actions. Actions are collected and executed sequentially after all tick functions complete. The `MaxActionsPerTick` config parameter enforces a limit when needed.
 
@@ -373,10 +562,12 @@ Each tick:
 1. Execute tick logic for all entities (collects invoked actions)
 2. Dispatch agent provider calls for agent-backed entities (collects actions)
 3. Merge and order all actions deterministically
-4. Execute actions sequentially
-5. Process transitions (entity movement)
-6. Commit state changes
-7. Log events
+4. Execute actions sequentially — resolving target and invoker for each
+5. Process transitions (entity movement via built-in `move`)
+6. Evaluate scoring functions (if registered)
+7. Commit state changes
+8. Write events to run log (deltas, actions, scores, lifecycle events)
+9. Write snapshot if tick is a snapshot interval boundary
 
 ### 7.2 Execution Order
 
@@ -503,7 +694,8 @@ POST /decide
   ],
   "system_prompt": "You are a fishing boat captain. Maximize profit over the season.",
   "history": [
-    { "tick": 41, "actions": [{ "name": "fish", "params": { "skill": 5 } }], "result": "ok" }
+    { "tick": 41, "actions": [{ "name": "fish", "params": { "skill": 5 } }], "result": "ok" },
+    { "tick": 40, "actions": [{ "name": "move", "params": { "target": "lake_beta" } }], "result": "failed", "reason": "insufficient resources" }
   ]
 }
 ```
@@ -595,11 +787,14 @@ In game mode, agents need to discover the world without prior knowledge. These q
 |-------|---------|
 | `/self` | The agent's own full state |
 | `/self/available_actions` | Actions the agent can currently invoke |
-| `/self/location` | The entity the agent is inside |
-| `/self/location/entities` | All entities at the agent's current location |
-| `/self/connections` | The agent's direct connections |
+| `/self/location` | The entity the agent is inside (public resources only) |
+| `/self/location/entities` | All entities at the agent's current location (public resources only) |
+| `/self/connections` | The agent's direct connections (with descriptions if configured) |
+| `/world/config` | World configuration: `MaxTicks`, `MaxActionsPerTick`, `TickUnit`, current tick |
 
 Broader perception (neighbors, type filtering, deeper traversal) must be granted in the perception config.
+
+**Hidden resource enforcement:** When the perception system assembles context for an agent, it strips all hidden and private resources from other entities. The agent sees only public resources. This means a fishing ground perceived by an agent might appear as `{"id": "lake_alpha", "type": "FishingGround"}` with no resource data at all if `fish_stock` is hidden — the agent knows the lake exists but not how much fish it has.
 
 ### 9.8 Performance
 
@@ -617,13 +812,20 @@ The engine also runs as an MCP server using the official Go SDK (`github.com/mod
 | Tool | Description |
 |------|-------------|
 | `step` | Advance the simulation by N ticks |
+| `step_back` | Reconstruct state at a previous tick (snapshot + delta replay) |
 | `run` | Run until a condition is met or max ticks reached |
+| `pause` | Pause a running simulation |
+| `resume` | Resume a paused simulation |
 | `query` | Execute a query language expression |
 | `snapshot` | Save the current world state |
 | `restore` | Restore a previous snapshot |
 | `set_resource` | Modify an entity's resource |
 | `list_entities` | List entities with optional type filter |
-| `get_events` | Retrieve the event log for the last N ticks |
+| `get_events` | Retrieve events from the run log for a tick range |
+| `get_state_at_tick` | Reconstruct full world state at an arbitrary tick |
+| `load_log` | Load a completed run log (`.db` file) for replay |
+| `unload_log` | Close a loaded run log |
+| `list_runs` | Enumerate available run log files |
 | `run_tournament` | Execute a tournament and return results |
 
 ---
@@ -642,8 +844,8 @@ The engine also runs as an MCP server using the official Go SDK (`github.com/mod
 | **Action Dispatcher** | Collect and execute actions in deterministic order |
 | **Transition Manager** | Handle entity movement between containers |
 | **Query Engine** | Parse and execute query language expressions |
-| **Snapshot Manager** | Save and restore world state |
-| **Event Log** | Record actions and state changes for observability |
+| **Run Log** | Write delta events, snapshots, and scores to per-run SQLite database |
+| **State Reconstructor** | Rebuild world state at any tick from snapshots + deltas |
 | **Agent Dispatcher** | Assemble perception, call agent providers in parallel, parse responses |
 | **MCP Server** | Expose engine capabilities over MCP |
 | **Tournament Runner** | Run agents against world corpora, aggregate scores, produce leaderboards |
@@ -661,16 +863,28 @@ for tick := 0; tick < maxTicks; tick++ {
     // Phase 3: Merge and order all actions deterministically
     allActions := merge(tickActions, agentActions)
 
-    // Phase 4: Execute actions sequentially
+    // Phase 4: Execute actions — resolve target + invoker, call handler
+    // All resource mutations during execution are captured as deltas
     for _, action := range allActions {
-        dispatcher.Execute(tables, action)
+        target := resolveTarget(action)
+        invoker := resolveInvoker(action)
+        handler := registry.GetAction(target.Type(), action.Name)
+        handler(target, invoker, action.Params)
     }
 
-    // Phase 5: Process transitions
-    transitions.Process(tables, connectionGraph)
+    // Phase 5: Process built-in moves (with movement cost)
+    transitions.Process(tables, connectionGraph, movementCostFn)
 
-    // Phase 6: Log events
-    eventLog.Record(tick, allActions)
+    // Phase 6: Evaluate scoring
+    scores := scoring.Evaluate(tables, tick)
+
+    // Phase 7: Write events to run log
+    runLog.WriteEvents(tick, allActions, scores)
+
+    // Phase 8: Snapshot if on interval boundary
+    if tick % config.Log.SnapshotInterval == 0 {
+        runLog.WriteSnapshot(tick, tables, connectionGraph)
+    }
 }
 ```
 
@@ -680,7 +894,248 @@ Unlike v2 of this spec, there is no code generation pipeline. World definitions 
 
 ---
 
-## 11. Predictive Power — Six Dimensions
+## 11. Event Log & Run Storage
+
+### 11.1 Design Philosophy
+
+Every state mutation in the engine is logged as a delta event. Rather than recording full snapshots of entity state at each tick, the engine writes the minimal change record: which entity, which field, old value, new value, and when. This keeps log size proportional to *activity* rather than *world size* — a 10,000-entity world where only 50 entities change per tick produces 50 delta records, not 10,000 entity snapshots.
+
+Full state at any tick is reconstructable by loading the nearest prior snapshot and replaying deltas forward. This gives the engine (and external tools like UIs) random access to any point in history without the storage cost of per-tick snapshots.
+
+### 11.2 Run Log Format
+
+Each simulation run produces a single SQLite database file. SQLite is chosen over flat formats (CSV, JSON lines) because the log needs to support random access by tick, filtering by entity and event type, and range queries — all of which are trivial with SQL indexes and painful with sequential file formats. A single `.db` file per run preserves the "one file per run" property while providing full query capabilities.
+
+**File naming convention:**
+
+```
+{run_dir}/{world_name}_{timestamp}_{run_id}.db
+```
+
+Example: `./runs/fishing_economy_20260403T141500_a1b2c3.db`
+
+The `run_id` is a short random suffix for uniqueness when the same world runs multiple times per second (e.g., during tournaments).
+
+### 11.3 Schema
+
+```sql
+-- Run-level metadata
+CREATE TABLE run_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+-- Populated at run start:
+--   world_name, dt, tick_unit, max_ticks, max_actions_per_tick,
+--   snapshot_interval, started_at, engine_version
+-- Updated at run end:
+--   completed_at, final_tick, status (completed | paused | error)
+
+-- Type definitions — schema and configuration for each entity type
+CREATE TABLE types (
+    name           TEXT PRIMARY KEY,
+    params_schema  TEXT NOT NULL,  -- JSON: { "param_name": default_value, ... }
+    resource_schema TEXT NOT NULL, -- JSON: { "resource_name": default_value, ... }
+    visibility     TEXT NOT NULL   -- JSON: { "resource_name": "public"|"hidden"|"private", ... }
+);
+
+-- Initial entity state at tick 0 (before any tick functions run)
+CREATE TABLE initial_entities (
+    entity_id TEXT PRIMARY KEY,
+    type_name TEXT NOT NULL,
+    params    TEXT NOT NULL,  -- JSON object
+    resources TEXT NOT NULL,  -- JSON object
+    location  TEXT            -- entity ID of container, or NULL
+);
+
+-- Initial connection graph at tick 0
+CREATE TABLE initial_connections (
+    from_id    TEXT NOT NULL,
+    to_id      TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    weight     REAL NOT NULL,
+    directed   INTEGER NOT NULL DEFAULT 0,  -- 0 = bidirectional, 1 = directed
+    PRIMARY KEY (from_id, to_id, type)
+);
+
+-- Delta events — the core of the log
+CREATE TABLE events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    tick       INTEGER NOT NULL,
+    phase      TEXT NOT NULL,     -- 'tick' | 'action' | 'transition' | 'scoring'
+    event_type TEXT NOT NULL,     -- see Event Types below
+    entity_id  TEXT NOT NULL,
+    field      TEXT,              -- resource/param name, or NULL for lifecycle events
+    old_value  TEXT,              -- JSON-encoded previous value, or NULL
+    new_value  TEXT,              -- JSON-encoded new value, or NULL
+    meta       TEXT               -- JSON object for event-specific metadata
+);
+
+CREATE INDEX idx_events_tick ON events(tick);
+CREATE INDEX idx_events_entity ON events(entity_id);
+CREATE INDEX idx_events_type ON events(event_type);
+
+-- Score evaluations per tick per agent
+CREATE TABLE scores (
+    tick      INTEGER NOT NULL,
+    agent_id  TEXT NOT NULL,
+    score     REAL NOT NULL,
+    PRIMARY KEY (tick, agent_id)
+);
+
+-- Periodic full-state snapshots for fast reconstruction
+CREATE TABLE snapshots (
+    tick        INTEGER PRIMARY KEY,
+    entities    TEXT NOT NULL,  -- JSON: { entity_id: { type, params, resources, location }, ... }
+    connections TEXT NOT NULL   -- JSON: [{ from, to, type, weight, directed }, ...]
+);
+```
+
+### 11.4 Event Types
+
+The `event_type` field in the `events` table classifies what happened. The `meta` field carries event-specific context as a JSON object.
+
+| Event Type | Description | `field` | `old_value` / `new_value` | `meta` |
+|------------|-------------|---------|---------------------------|--------|
+| `resource_set` | A resource was modified | resource name | old → new (JSON) | `{"source": "tick"\|"action", "action_name": "...", "invoker_id": "..."}` |
+| `action_invoked` | An action was executed | NULL | NULL | `{"action": "name", "invoker_id": "...", "target_id": "...", "params": {...}, "result": "ok"\|"failed", "reason": "..."}` |
+| `entity_spawned` | A new entity was created | NULL | NULL → initial resources (JSON) | `{"type": "...", "location": "...", "spawned_by": "..."}` |
+| `entity_destroyed` | An entity was removed | NULL | final resources (JSON) → NULL | `{"destroyed_by": "..."}` |
+| `entity_moved` | An entity changed location | `"location"` | old container ID → new container ID | `{"connection_type": "...", "connection_weight": 0.0}` |
+| `connection_added` | A connection was created | NULL | NULL | `{"from": "...", "to": "...", "type": "...", "weight": 0.0, "directed": false}` |
+| `connection_removed` | A connection was removed | NULL | NULL | `{"from": "...", "to": "...", "type": "..."}` |
+| `agent_decision` | An agent provider was consulted | NULL | NULL | `{"agent_id": "...", "provider": "...", "actions": [...], "latency_ms": 0}` |
+
+### 11.5 Delta Capture
+
+The engine intercepts all state-mutating operations on the `*Entity` facade and records deltas before committing them. This happens transparently — world authors don't need to do anything.
+
+**What triggers a delta:**
+
+- `e.Set("fuel", 80.0)` → `resource_set` event with old and new values
+- `e.ListPush("cargo", item)` → `resource_set` event (old and new are the full list as JSON)
+- `e.MapSet("prices", "fish", 12.5)` → `resource_set` event (old and new are the full map as JSON)
+- `e.Act("move", ...)` → `entity_moved` event when the transition is processed
+- `e.Spawn(...)` → `entity_spawned` event
+- `e.Destroy(...)` → `entity_destroyed` event
+- `e.ConnectTo(...)` → `connection_added` event
+- `e.Disconnect(...)` → `connection_removed` event
+
+For complex types (lists, sets, queues, maps), the delta records the full before/after state of the collection. This is simpler and more reliable than trying to encode individual element-level mutations, and the collections are typically small.
+
+**Batching:** Deltas are accumulated in memory during a tick and flushed to SQLite in a single transaction at tick end. This avoids per-mutation write overhead and ensures each tick's events are atomically committed.
+
+### 11.6 Periodic Snapshots
+
+Every `SnapshotInterval` ticks (default: 100), the engine writes a full snapshot of all entity state and the connection graph to the `snapshots` table. Tick 0 is always snapshotted (equivalent to the initial state recorded in `initial_entities` and `initial_connections`, but in the unified snapshot format for consistency).
+
+Snapshots serve one purpose: bounding the cost of state reconstruction. To reconstruct state at tick T, the State Reconstructor:
+
+1. Finds the highest snapshot tick ≤ T
+2. Loads that snapshot
+3. Replays all delta events from (snapshot tick + 1) through T
+
+Worst-case replay is `SnapshotInterval - 1` ticks of deltas. For a default interval of 100, that's at most 99 ticks of deltas regardless of how long the simulation ran.
+
+### 11.7 State Reconstruction
+
+The State Reconstructor is the engine component that builds world state at arbitrary ticks from the run log. It is used by:
+
+- `step_back` MCP tool — stepping the simulation backward
+- `get_state_at_tick` MCP tool — random access to any tick
+- `restore` MCP tool — restoring a previous state during a live run
+- External tools (UIs, analysis scripts) reading log files
+
+**Algorithm:**
+
+```go
+func (r *Reconstructor) StateAt(db *sql.DB, tick int) *WorldState {
+    // Find nearest snapshot at or before the target tick
+    snap := r.loadSnapshot(db, tick)
+
+    // Load and apply deltas from (snapshot tick + 1) through target tick
+    deltas := r.loadEvents(db, snap.Tick+1, tick)
+    state := snap.ToWorldState()
+    for _, delta := range deltas {
+        state.Apply(delta)
+    }
+    return state
+}
+```
+
+The reconstruction result is a read-only `WorldState` struct containing all entity resources, parameters, locations, and connections at the requested tick. It is not a live `World` — tick functions and action handlers are not attached. This is intentional: the reconstructed state is for inspection, not execution.
+
+### 11.8 Log Configuration
+
+```go
+w := we.New(we.Config{
+    // ...
+    Log: we.LogConfig{
+        Dir:              "./runs",  // directory for run log files
+        SnapshotInterval: 100,       // full snapshot every N ticks (0 = never, not recommended)
+        Enabled:          true,      // set false to disable logging entirely (e.g., for benchmarking)
+    },
+})
+```
+
+When logging is disabled, no SQLite file is created and no deltas are captured. The engine runs at full speed with no observability overhead. This is useful for performance benchmarks and tournament runs where only the final score matters.
+
+### 11.9 Log Size Estimates
+
+For a fishing world with 7 entities, ~365 ticks, ~5 resource changes per entity per tick:
+
+- Delta events: ~12,800 rows × ~200 bytes ≈ **2.5 MB**
+- Snapshots (every 100 ticks): 4 snapshots × ~2 KB ≈ **8 KB**
+- Scores: 365 rows × ~30 bytes ≈ **11 KB**
+- SQLite overhead + indexes ≈ **~500 KB**
+- **Total: ~3 MB**
+
+For a large world (10,000 entities, 10,000 ticks, 20% active per tick):
+
+- Delta events: ~100M rows × ~200 bytes ≈ **20 GB**
+- Snapshots: 100 snapshots × ~5 MB ≈ **500 MB**
+- **Total: ~20 GB**
+
+At the large end, log size becomes significant. The engine should log a warning if the estimated log size exceeds a configurable threshold. For very large simulations, world authors can disable logging or increase the snapshot interval to reduce snapshot overhead (delta volume is driven by activity and can't be reduced without reducing simulation fidelity).
+
+### 11.10 Run Log API
+
+The engine exposes a Go API for reading run logs programmatically:
+
+```go
+// Open a completed run log
+log, err := we.OpenRunLog("./runs/fishing_economy_20260403T141500_a1b2c3.db")
+defer log.Close()
+
+// Metadata
+meta := log.Meta()  // RunMeta struct: world name, config, timestamps
+
+// State reconstruction
+state := log.StateAt(200)  // full world state at tick 200
+fuel := state.Entity("boat_1").Get("fuel")
+
+// Event queries
+events := log.Events(we.EventQuery{
+    TickFrom:  100,
+    TickTo:    200,
+    EntityID:  "boat_1",
+    EventType: "resource_set",
+})
+
+// Score history
+scores := log.Scores("boat_1")  // []TickScore: [{Tick: 0, Score: 1000}, ...]
+
+// Iterate ticks
+for tick := 0; tick < meta.FinalTick; tick++ {
+    events := log.EventsAt(tick)
+    // ...
+}
+```
+
+This API is what the MCP `load_log`, `get_state_at_tick`, and `get_events` tools use under the hood. It is also available to world authors for writing custom analysis scripts.
+
+---
+
+## 12. Predictive Power — Six Dimensions
 
 The engine's outputs should be interpreted through six dimensions that determine modeling accuracy:
 
@@ -697,15 +1152,15 @@ Prediction error compounds multiplicatively. The engine's honest value is in **e
 
 ---
 
-## 12. Game Mode — The AGI Challenge
+## 13. Game Mode — The AGI Challenge
 
-### 12.1 Concept
+### 13.1 Concept
 
 World authors define arbitrary worlds. Agent developers build agents that are dropped in blind. The agent must discover the world's rules, identify what "thriving" means, and act effectively — all through perception and actions, with no access to the world's source code.
 
 The goal: build an agent that can survive and thrive across as many unique worlds as possible.
 
-### 12.2 What the Agent Sees
+### 13.2 What the Agent Sees
 
 The agent receives only what the perception system provides:
 
@@ -716,7 +1171,7 @@ The agent receives only what the perception system provides:
 
 The agent does **not** see: the world's Go source code, other entities' tick logic, the scoring function (unless explicitly exposed), or anything outside its perception radius.
 
-### 12.3 Scoring
+### 13.3 Scoring
 
 The scoring system is a function of **any aspect of the world**, not just the agent's own state. Scoring functions use queries to read from anywhere:
 
@@ -761,14 +1216,14 @@ w.ScoreVisibility(we.Hidden)
 w.ScoreVisibility(we.Hints("Keep the ecosystem healthy while earning a living"))
 ```
 
-### 12.4 Information Budget
+### 13.4 Information Budget
 
 - **Perception scope**: How far the agent can see (world-author configured)
 - **Query limit per tick**: Optional cap on discovery queries
 - **Action limit per tick**: `MaxActionsPerTick` applies to agents
 - **Memory**: The agent provider manages memory; the engine sends recent history but doesn't guarantee the agent retains it
 
-### 12.5 Tournament Structure
+### 13.5 Tournament Structure
 
 ```go
 t := we.NewTournament(we.TournamentConfig{
@@ -793,7 +1248,7 @@ results.PrintLeaderboard()
 
 Each world function returns a configured `*World` with types, entities, connections, and scoring. The tournament runner injects each agent as the player entity, runs the simulation, evaluates scoring, repeats for statistical significance, and aggregates across all worlds.
 
-### 12.6 World Design Guidelines
+### 13.6 World Design Guidelines
 
 For effective AGI testing, worlds should:
 
@@ -803,7 +1258,7 @@ For effective AGI testing, worlds should:
 - Be **diverse** — the corpus should span different domains and mechanics
 - Be **completable** — a good agent can score well within the tick limit
 
-### 12.7 Anti-Gaming
+### 13.7 Anti-Gaming
 
 - New worlds are regularly added to the tournament corpus
 - Worlds can randomize parameters between runs
@@ -812,7 +1267,7 @@ For effective AGI testing, worlds should:
 
 ---
 
-## 13. Test Scenarios
+## 14. Test Scenarios
 
 The following toy problems exercise the engine's core mechanics:
 
@@ -827,7 +1282,7 @@ The following toy problems exercise the engine's core mechanics:
 
 ---
 
-## 14. Complete Example: Fishing World
+## 15. Complete Example: Fishing World
 
 ```go
 package main
@@ -843,6 +1298,10 @@ func main() {
         TickUnit:          "day",
         MaxTicks:          365,
         MaxActionsPerTick: 3,
+        Log: we.LogConfig{
+            Dir:              "./runs",
+            SnapshotInterval: 100,
+        },
     })
 
     // --- Agent providers ---
@@ -860,24 +1319,44 @@ func main() {
     ground := w.Type("FishingGround")
     ground.Params(we.P{"max_fish_stock": 2000.0, "regen_rate": 5.0})
     ground.Resources(we.P{"fish_stock": 0.0})
+    ground.Hidden("fish_stock") // agents can't see stock — must infer from catch rates
     ground.Tick(func(e *we.Entity, dt float64) {
         stock := e.Get("fish_stock")
         max := e.Param("max_fish_stock")
         rate := e.Param("regen_rate")
         e.Set("fish_stock", math.Min(max, stock+rate*dt))
     })
-    ground.Action("fish", func(e *we.Entity, p we.P) {
+    ground.Action("fish", func(target *we.Entity, invoker *we.Entity, p we.P) we.ActionResult {
         skill := p.Float("skill")
-        e.Set("fish_stock", math.Max(0, e.Get("fish_stock")-skill*0.5))
+        if invoker.GetOr("fuel", 0) < 1.0 {
+            return we.Fail("insufficient resources")
+        }
+        stock := target.Get("fish_stock")
+        if stock <= 0 {
+            return we.Fail("nothing to catch")
+        }
+        caught := math.Min(skill*0.3, stock)
+        target.Set("fish_stock", stock-caught)
+        invoker.Set("catch", invoker.Get("catch")+caught)
+        invoker.Set("fuel", invoker.Get("fuel")-1.0)
+        return we.OK()
     })
 
     // Port: provides refueling
     port := w.Type("Port")
     port.Params(we.P{"fuel_price": 2.0})
     port.Resources(we.P{"fuel_supply": 5000.0})
-    port.Action("refuel", func(e *we.Entity, p we.P) {
+    port.Action("refuel", func(target *we.Entity, invoker *we.Entity, p we.P) we.ActionResult {
         amount := p.Float("amount")
-        e.Set("fuel_supply", e.Get("fuel_supply")-amount)
+        price := target.Param("fuel_price")
+        cost := amount * price
+        if invoker.GetOr("money", 0) < cost {
+            return we.Fail("can't afford")
+        }
+        target.Set("fuel_supply", target.Get("fuel_supply")-amount)
+        invoker.Set("fuel", invoker.Get("fuel")+amount)
+        invoker.Set("money", invoker.Get("money")-cost)
+        return we.OK()
     })
 
     // NPCBoat: a simple AI-driven fishing boat
@@ -952,6 +1431,26 @@ func main() {
     w.Connect("port_alpha", "port_beta", "sea_route", 50.0)
     w.Connect("lake_alpha", "lake_beta", "waterway", 30.0)
 
+    // --- Movement cost ---
+
+    w.MovementCost(func(mover *we.Entity, conn we.Connection) bool {
+        fuelCost := conn.Weight * 0.1
+        if mover.GetOr("fuel", 0) < fuelCost {
+            return false
+        }
+        mover.Set("fuel", mover.Get("fuel")-fuelCost)
+        return true
+    })
+
+    // --- Connection descriptions (what agents see) ---
+
+    w.ConnectionDescription(func(conn we.Connection) string {
+        if conn.Type == "sea_route" {
+            return "A long sea route — travel will be costly"
+        }
+        return "A short path"
+    })
+
     // --- Placement ---
 
     w.Place("boat_1", "lake_alpha")
@@ -976,7 +1475,7 @@ func main() {
 
 ---
 
-## 15. Summary
+## 16. Summary
 
 This design provides:
 
@@ -986,11 +1485,21 @@ This design provides:
 - Types and instances as natural Go constructs
 - ECS-inspired property table storage for cache-friendly, parallelizable execution at scale
 - A typed connection graph for modeling adjacency, routes, and relationships
+- **Resource visibility** — public, hidden, and private resources for information asymmetry
+- **Two-party actions** with colocation enforcement — local actions require proximity, remote actions for signaling
+- **Action feedback** — success/failure results with world-author-controlled detail
+- **Entity lifecycle** — spawn and destroy entities during simulation
+- **Movement cost** — a global function controlling the economics of travel
+- **Connection descriptions** — world-author-controlled metadata visible to agents
 - A path-based query language for selecting, traversing, and aggregating world state
 - An **Agent Provider Interface** — a standard HTTP contract for any LLM, bot, or harness
 - A **proxy architecture** supporting Anthropic, OpenAI, Ollama, Claude Code Channels, and custom endpoints
 - A perception and discovery system controlling what external agents can see
-- MCP server interface for external orchestration and tournament management
+- **Delta-based event logging** — every state mutation recorded as a minimal change event in per-run SQLite databases
+- **Periodic snapshots** — full-state checkpoints enabling fast state reconstruction at any tick
+- **State reconstruction** — rebuild world state at any tick from snapshots + deltas, enabling backward stepping and random-access replay
+- **Run log API** — programmatic access to event history, score timelines, and reconstructed state for analysis and tooling
+- MCP server interface for external orchestration, replay control, and tournament management
 - A **game mode** — an open-ended AGI challenge where agents compete across diverse, unknown worlds
 - **World-aware scoring** — scoring functions that can read any aspect of world state, not just agent state
 - An explicit framework for understanding modeling accuracy across six dimensions
