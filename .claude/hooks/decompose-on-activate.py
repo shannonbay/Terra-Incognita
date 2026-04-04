@@ -55,19 +55,21 @@ try:
         conn.close()
         sys.exit(0)
 
-    # Allow if task is explicitly marked atomic
-    row = conn.execute(
-        'SELECT state FROM tasks WHERE id = ? LIMIT 1',
+    # Allow if task is explicitly marked atomic in ANY plan (handles multiple plans
+    # sharing the same short task_id like "1.3")
+    rows = conn.execute(
+        'SELECT state FROM tasks WHERE id = ?',
         (task_id,)
-    ).fetchone()
+    ).fetchall()
     conn.close()
-    if row and row[0]:
-        try:
-            state = json.loads(row[0])
-            if state.get('atomic'):
-                sys.exit(0)
-        except Exception:
-            pass
+    for row in rows:
+        if row and row[0]:
+            try:
+                state = json.loads(row[0])
+                if state.get('atomic'):
+                    sys.exit(0)
+            except Exception:
+                pass
 
     # Block and instruct Claude to decompose or mark atomic
     print(json.dumps({
