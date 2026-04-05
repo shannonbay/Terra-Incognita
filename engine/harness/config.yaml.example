@@ -2,6 +2,13 @@
 # Copy to config.yaml and edit as needed.
 # Precedence: CLI flags > environment variables > this file > built-in defaults.
 
+# LLM provider:
+#   "api"          — Anthropic API (requires ANTHROPIC_API_KEY). Default.
+#   "claude-code"  — `claude` CLI subprocess, uses your active claude auth.
+#                    Run `claude auth login` first. Uses your Claude.ai Pro/Max
+#                    plan — no API key or per-token billing required.
+provider: api
+
 # Model to use. Any Claude model ID is valid.
 model: claude-sonnet-4-6
 

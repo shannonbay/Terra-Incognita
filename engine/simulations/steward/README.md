@@ -11,10 +11,19 @@ See [`specs/worlds/the_steward.md`](../../../specs/worlds/the_steward.md) for th
 
 ## Quick start
 
+**Using the Anthropic API** (pay-per-token):
 ```bash
-# From the repo root
 cd engine
 ANTHROPIC_API_KEY=sk-ant-... go run ./simulations/steward/cmd/
+```
+
+**Using your Claude.ai Pro/Max plan** (no API key needed):
+```bash
+# One-time: log in with your Claude.ai account
+claude auth login
+
+cd engine
+go run ./simulations/steward/cmd/ -provider claude-code
 ```
 
 This will:
@@ -30,6 +39,7 @@ This will:
 -port int             Harness HTTP port (default: 9191)
 -log-dir string       Harness JSONL log directory (default: ./steward-logs)
 -run-dir string       World SQLite run log directory (default: ./steward-runs)
+-provider string      "api" (default, needs ANTHROPIC_API_KEY) or "claude-code"
 ```
 
 ## Output

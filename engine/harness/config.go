@@ -19,6 +19,9 @@ type HarnessConfig struct {
 	LogDir            string  `yaml:"log_dir"`
 	ThinkBudgetTokens int     `yaml:"think_budget_tokens"`
 	MaxTokens         int     `yaml:"max_tokens"`
+	// Provider selects the LLM backend: "api" (Anthropic API key) or "claude-code"
+	// (claude CLI subprocess — uses active claude auth, e.g. Claude.ai Pro/Max plan).
+	Provider string `yaml:"provider"`
 }
 
 // DefaultConfig returns sensible defaults.
@@ -31,6 +34,7 @@ func DefaultConfig() HarnessConfig {
 		APIKeyEnv:       "ANTHROPIC_API_KEY",
 		LogDir:          "./harness-logs",
 		MaxTokens:       4096,
+		Provider:        "api",
 	}
 }
 
@@ -75,6 +79,9 @@ func LoadConfig(configPath string, args []string) (HarnessConfig, error) {
 	if v := os.Getenv("ANTHROPIC_API_KEY_ENV"); v != "" {
 		cfg.APIKeyEnv = v
 	}
+	if v := os.Getenv("HARNESS_PROVIDER"); v != "" {
+		cfg.Provider = v
+	}
 
 	// 3. CLI flags
 	if args != nil {
@@ -86,6 +93,7 @@ func LoadConfig(configPath string, args []string) (HarnessConfig, error) {
 		logDir := fs.String("log-dir", cfg.LogDir, "Directory for JSONL run logs")
 		maxTokens := fs.Int("max-tokens", cfg.MaxTokens, "Max tokens per LLM response")
 		thinkBudget := fs.Int("think-budget-tokens", cfg.ThinkBudgetTokens, "Extended thinking budget tokens (0 = disabled)")
+		provider := fs.String("provider", cfg.Provider, `LLM backend: "api" (Anthropic API key) or "claude-code" (claude CLI, uses Claude.ai plan)`)
 		if err := fs.Parse(args); err != nil {
 			return cfg, err
 		}
@@ -96,6 +104,7 @@ func LoadConfig(configPath string, args []string) (HarnessConfig, error) {
 		cfg.LogDir = *logDir
 		cfg.MaxTokens = *maxTokens
 		cfg.ThinkBudgetTokens = *thinkBudget
+		cfg.Provider = *provider
 	}
 
 	return cfg, nil

@@ -20,8 +20,14 @@ func main() {
 		log.Fatalf("loading config: %v", err)
 	}
 
-	if cfg.APIKey() == "" {
-		log.Fatalf("ANTHROPIC_API_KEY is not set")
+	// Auth check depends on provider.
+	switch cfg.Provider {
+	case "claude-code":
+		log.Printf("provider=claude-code  using active `claude` CLI auth (Claude.ai plan or API key)")
+	default:
+		if cfg.APIKey() == "" {
+			log.Fatalf("ANTHROPIC_API_KEY is not set (use --provider claude-code to use Claude.ai plan instead)")
+		}
 	}
 
 	srv, err := harness.New(cfg)
@@ -32,7 +38,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("Terra Incognita harness  model=%s  port=%d", cfg.Model, cfg.Port)
+	log.Printf("Terra Incognita harness  provider=%s  model=%s  port=%d",
+		cfg.Provider, cfg.Model, cfg.Port)
 
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Printf("server stopped: %v", err)

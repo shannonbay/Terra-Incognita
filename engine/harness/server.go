@@ -12,35 +12,49 @@ import (
 
 // Server is the harness HTTP server bridging worldengine and an LLM provider.
 type Server struct {
-	config HarnessConfig
-	conv   *ConversationManager
-	llm    *LLMClient
-	logger *RunLogger
-	mux    *http.ServeMux
+	config   HarnessConfig
+	provider Provider
+	logger   *RunLogger
+	mux      *http.ServeMux
 }
 
-// New creates a Server with a real Claude API client.
+// New creates a Server using the provider specified in cfg.Provider.
+// "api" (default) uses the Anthropic API directly (requires ANTHROPIC_API_KEY).
+// "claude-code" uses the `claude` CLI subprocess (uses active claude auth).
 func New(cfg HarnessConfig) (*Server, error) {
-	llm, err := NewLLMClient(cfg)
-	if err != nil {
-		return nil, err
+	var p Provider
+
+	switch cfg.Provider {
+	case "claude-code":
+		p = newClaudeCodeProvider(cfg)
+	default: // "api" or empty
+		llm, err := NewLLMClient(cfg)
+		if err != nil {
+			return nil, err
+		}
+		p = newAPIProvider(cfg, llm)
 	}
-	return NewWithLLM(cfg, llm)
+
+	return newWithProvider(cfg, p)
 }
 
 // NewWithLLM constructs a Server with a provided LLMClient (used in tests).
 func NewWithLLM(cfg HarnessConfig, llm *LLMClient) (*Server, error) {
+	return newWithProvider(cfg, newAPIProvider(cfg, llm))
+}
+
+// newWithProvider is the internal constructor used by both New and NewWithLLM.
+func newWithProvider(cfg HarnessConfig, p Provider) (*Server, error) {
 	logger, err := NewRunLogger(cfg.LogDir)
 	if err != nil {
 		return nil, fmt.Errorf("creating run logger: %w", err)
 	}
 
 	s := &Server{
-		config: cfg,
-		conv:   NewConversationManager(cfg.MaxHistoryTicks),
-		llm:    llm,
-		logger: logger,
-		mux:    http.NewServeMux(),
+		config:   cfg,
+		provider: p,
+		logger:   logger,
+		mux:      http.NewServeMux(),
 	}
 	s.mux.HandleFunc("/decide", s.handleDecide)
 	s.mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -63,7 +77,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
 
-	log.Printf("harness listening on %s  model=%s  log=%s", ln.Addr(), s.config.Model, s.logger.RunDir())
+	log.Printf("harness listening on %s  provider=%s  model=%s  log=%s",
+		ln.Addr(), s.config.Provider, s.config.Model, s.logger.RunDir())
 
 	srv := &http.Server{Handler: s}
 	errCh := make(chan error, 1)
@@ -118,52 +133,29 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// decide is the core logic: conversation → LLM → log → actions.
+// decide calls the provider and logs the result.
 func (s *Server) decide(ctx context.Context, req DecideRequest) (*DecideResponse, error) {
-	agentID := req.AgentID
-
-	// Append the new perception to conversation history.
-	s.conv.AppendUser(agentID, req.Tick, req.Perception, req.AvailableActions)
-
-	// Build full message list for the LLM.
-	messages := s.conv.Messages(agentID)
-
-	// Call the LLM.
-	result, err := s.llm.Decide(ctx, req.SystemPrompt, messages)
+	result, err := s.provider.Decide(ctx, req.AgentID, req)
 	if err != nil {
 		return nil, err
 	}
 
-	// Persist any record_finding note.
-	if result.FindingText != "" {
-		s.conv.AppendFinding(agentID, result.FindingText)
-	}
-
-	// Append assistant turn + tool results to history.
-	if result.RawResponse != nil {
-		assistantMsg := result.RawResponse.ToParam()
-		toolResults := BuildToolResults(result.RawResponse)
-		s.conv.AppendAssistantTurn(agentID, assistantMsg, toolResults)
-	}
-
-	// Write the log entry.
 	_ = s.logger.Write(LogEntry{
 		Tick:             req.Tick,
-		AgentID:          agentID,
+		AgentID:          req.AgentID,
 		Perception:       req.Perception,
 		AvailableActions: req.AvailableActions,
 		ReasoningText:    result.ReasoningText,
 		ActionsTaken:     result.Actions,
 		LatencyMs:        result.LatencyMs,
 		FindingText:      result.FindingText,
-		Notes:            s.conv.Notes(agentID),
+		Notes:            s.provider.Notes(req.AgentID),
 	})
 
 	actions := result.Actions
 	if actions == nil {
 		actions = doNothingFallback(req.AvailableActions)
 	}
-
 	return &DecideResponse{Actions: actions}, nil
 }
 

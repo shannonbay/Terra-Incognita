@@ -29,10 +29,11 @@ func main() {
 	maxTicks := flag.Int("ticks", 100, "Simulation tick count")
 	logDir := flag.String("log-dir", "./steward-logs", "Harness JSONL log directory")
 	runDir := flag.String("run-dir", "./steward-runs", "World SQLite run log directory")
+	provider := flag.String("provider", "api", `LLM provider: "api" (requires ANTHROPIC_API_KEY) or "claude-code" (uses claude CLI auth / Claude.ai plan)`)
 	flag.Parse()
 
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		log.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	if *provider == "api" && os.Getenv("ANTHROPIC_API_KEY") == "" {
+		log.Fatal("ANTHROPIC_API_KEY not set — set it or use -provider claude-code")
 	}
 
 	// --- harness ---
@@ -40,6 +41,7 @@ func main() {
 	harnessCfg.Model = *model
 	harnessCfg.Port = *port
 	harnessCfg.LogDir = *logDir
+	harnessCfg.Provider = *provider
 
 	srv, err := harness.New(harnessCfg)
 	if err != nil {
