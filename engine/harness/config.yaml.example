@@ -1,0 +1,28 @@
+# Terra Incognita Agent Harness — sample configuration
+# Copy to config.yaml and edit as needed.
+# Precedence: CLI flags > environment variables > this file > built-in defaults.
+
+# Model to use. Any Claude model ID is valid.
+model: claude-sonnet-4-6
+
+# Sampling temperature (0.0–1.0).
+temperature: 1.0
+
+# How many ticks of conversation to keep in the Claude context window.
+# Older ticks are silently compacted into a summary string prepended to the next message.
+max_history_ticks: 20
+
+# HTTP port the harness listens on.
+port: 9090
+
+# Environment variable name that holds the Anthropic API key.
+api_key_env: ANTHROPIC_API_KEY
+
+# Directory for per-run JSONL logs.
+log_dir: ./harness-logs
+
+# Max tokens for each LLM response.
+max_tokens: 4096
+
+# Extended thinking budget in tokens (0 = disabled).
+think_budget_tokens: 0
