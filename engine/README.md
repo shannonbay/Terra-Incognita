@@ -35,7 +35,7 @@ ANTHROPIC_API_KEY=sk-ant-... go run ./simulations/steward/cmd/
 ```bash
 claude auth login        # one-time
 cd engine
-go run ./simulations/steward/cmd/ -provider claude-code
+go run ./simulations/steward/cmd/ -provider claude-code -ticks 100
 ```
 
 After the run, a post-run behavioural analysis is printed to stdout. Full JSONL decision logs land in `./steward-logs/` and the SQLite run log in `./steward-runs/`.
